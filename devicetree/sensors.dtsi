@@ -1,0 +1,264 @@
+/*
+ * Device Tree Include for Sensor Drivers
+ *
+ * This file contains example device tree bindings for all
+ * sensor drivers in this tutorial.
+ *
+ * Include this in your board DTS file and enable the sensors
+ * you need by setting status = "okay".
+ */
+
+/* ============================================================
+ * MPU6050 - I2C Accelerometer/Gyroscope
+ * ============================================================
+ *
+ * The MPU6050 connects via I2C at address 0x68 (or 0x69 if AD0 high)
+ *
+ * Required properties:
+ * - compatible: "invensense,mpu6050" or "invensense,mpu6500" or "invensense,mpu9250"
+ * - reg: I2C address
+ *
+ * Optional properties:
+ * - interrupt-parent, interrupts: Data ready interrupt
+ * - vdd-supply: Power supply regulator
+ * - vddio-supply: I/O power supply
+ */
+
+/* Example: MPU6050 on I2C bus 1 */
+&i2c1 {
+    status = "okay";
+    clock-frequency = <400000>;
+
+    mpu6050@68 {
+        compatible = "invensense,mpu6050";
+        reg = <0x68>;
+        status = "disabled";  /* Change to "okay" to enable */
+
+        /* Optional: Data ready interrupt on GPIO1 pin 5 */
+        interrupt-parent = <&gpio1>;
+        interrupts = <5 IRQ_TYPE_EDGE_RISING>;
+
+        /* Optional: Power supply */
+        vdd-supply = <&reg_3v3>;
+        vddio-supply = <&reg_3v3>;
+    };
+};
+
+/* ============================================================
+ * BMP280 - I2C/SPI Pressure/Temperature Sensor
+ * ============================================================
+ *
+ * The BMP280 supports both I2C and SPI interfaces.
+ *
+ * I2C address: 0x76 (SDO=GND) or 0x77 (SDO=VCC)
+ *
+ * Required properties:
+ * - compatible: "bosch,bmp280"
+ * - reg: I2C address or SPI chip select
+ *
+ * Optional properties:
+ * - vdda-supply: Analog power supply
+ * - vddd-supply: Digital power supply
+ */
+
+/* Example: BMP280 on I2C */
+&i2c1 {
+    bmp280@76 {
+        compatible = "bosch,bmp280";
+        reg = <0x76>;
+        status = "disabled";
+
+        vdda-supply = <&reg_3v3>;
+        vddd-supply = <&reg_3v3>;
+    };
+};
+
+/* Example: BMP280 on SPI */
+&spi0 {
+    status = "okay";
+
+    bmp280@0 {
+        compatible = "bosch,bmp280";
+        reg = <0>;  /* Chip select 0 */
+        spi-max-frequency = <10000000>;
+        status = "disabled";
+
+        vdda-supply = <&reg_3v3>;
+        vddd-supply = <&reg_3v3>;
+    };
+};
+
+/* ============================================================
+ * HC-SR04 - Ultrasonic Distance Sensor
+ * ============================================================
+ *
+ * The HC-SR04 uses two GPIO pins: trigger (output) and echo (input)
+ *
+ * Required properties:
+ * - compatible: "hc-sr04"
+ * - trigger-gpios: GPIO for trigger pulse
+ * - echo-gpios: GPIO for echo input
+ */
+
+/ {
+    hc_sr04: ultrasonic-sensor {
+        compatible = "hc-sr04";
+        status = "disabled";
+
+        /* GPIO configuration - adjust for your board */
+        trigger-gpios = <&gpio1 10 GPIO_ACTIVE_HIGH>;
+        echo-gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;
+    };
+};
+
+/* ============================================================
+ * u-blox NEO-M8N - GPS/GNSS Module
+ * ============================================================
+ *
+ * The NEO-M8N connects via UART.
+ *
+ * Required properties:
+ * - compatible: "u-blox,neo-m8" or "u-blox,neo-m8n"
+ *
+ * Optional properties:
+ * - vcc-supply: Power supply
+ * - reset-gpios: Reset control
+ * - current-speed: UART baud rate (default 9600)
+ */
+
+/* Example: NEO-M8N on UART2 */
+&uart2 {
+    status = "okay";
+
+    gnss {
+        compatible = "u-blox,neo-m8n";
+        status = "disabled";
+
+        /* Optional: Power and reset control */
+        vcc-supply = <&reg_3v3>;
+        reset-gpios = <&gpio1 20 GPIO_ACTIVE_LOW>;
+
+        /* UART settings */
+        current-speed = <9600>;
+    };
+};
+
+/* ============================================================
+ * Custom UART Controller
+ * ============================================================
+ *
+ * Example binding for custom UART peripheral driver.
+ *
+ * Required properties:
+ * - compatible: "vendor,custom-uart"
+ * - reg: Register base address and size
+ * - interrupts: IRQ number
+ * - clocks: Reference to UART clock
+ *
+ * Optional properties:
+ * - dmas, dma-names: DMA channels for TX and RX
+ */
+
+/ {
+    soc {
+        custom_uart0: serial@40000000 {
+            compatible = "vendor,custom-uart";
+            reg = <0x40000000 0x100>;
+            interrupts = <GIC_SPI 32 IRQ_TYPE_LEVEL_HIGH>;
+            clocks = <&uart_clk>;
+            clock-names = "uart";
+            status = "disabled";
+
+            /* Optional: DMA support */
+            dmas = <&dma 0>, <&dma 1>;
+            dma-names = "tx", "rx";
+
+            /* Port identification */
+            port-id = <0>;
+        };
+    };
+};
+
+/* ============================================================
+ * Custom SPI Controller
+ * ============================================================
+ *
+ * Example binding for custom SPI peripheral driver.
+ *
+ * Required properties:
+ * - compatible: "vendor,custom-spi"
+ * - reg: Register base address and size
+ * - interrupts: IRQ number
+ * - clocks: Reference to SPI clock
+ * - #address-cells: Must be 1
+ * - #size-cells: Must be 0
+ *
+ * Optional properties:
+ * - dmas, dma-names: DMA channels for TX and RX
+ * - cs-gpios: GPIO chip selects
+ */
+
+/ {
+    soc {
+        custom_spi0: spi@40001000 {
+            compatible = "vendor,custom-spi";
+            reg = <0x40001000 0x100>;
+            interrupts = <GIC_SPI 33 IRQ_TYPE_LEVEL_HIGH>;
+            clocks = <&spi_clk>;
+            clock-names = "spi";
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "disabled";
+
+            /* Optional: DMA support */
+            dmas = <&dma 2>, <&dma 3>;
+            dma-names = "tx", "rx";
+
+            /* GPIO chip selects */
+            cs-gpios = <&gpio1 0 GPIO_ACTIVE_LOW>,
+                       <&gpio1 1 GPIO_ACTIVE_LOW>;
+
+            /* Example SPI device */
+            spi_device@0 {
+                compatible = "vendor,spi-device";
+                reg = <0>;
+                spi-max-frequency = <10000000>;
+                status = "disabled";
+            };
+        };
+    };
+};
+
+/* ============================================================
+ * Common Regulator Definitions
+ * ============================================================
+ *
+ * Example regulators used by sensors.
+ * Replace with actual regulator nodes for your board.
+ */
+
+/ {
+    regulators {
+        compatible = "simple-bus";
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        reg_3v3: regulator-3v3 {
+            compatible = "regulator-fixed";
+            regulator-name = "3v3";
+            regulator-min-microvolt = <3300000>;
+            regulator-max-microvolt = <3300000>;
+            regulator-boot-on;
+            regulator-always-on;
+        };
+
+        reg_1v8: regulator-1v8 {
+            compatible = "regulator-fixed";
+            regulator-name = "1v8";
+            regulator-min-microvolt = <1800000>;
+            regulator-max-microvolt = <1800000>;
+            regulator-boot-on;
+            regulator-always-on;
+        };
+    };
+};

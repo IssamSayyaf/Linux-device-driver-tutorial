@@ -86,10 +86,14 @@ Linux-device-driver-tutorial/
 │   ├── 07-uart-subsystem.md       # UART/Serial subsystem
 │   ├── 08-iio-subsystem.md        # Industrial I/O subsystem
 │   ├── 09-gpio-subsystem.md       # GPIO subsystem
-│   ├── 10-interrupt-handling.md   # IRQ and threaded interrupts
-│   ├── 11-dma-engine.md           # DMA operations
-│   ├── 12-device-tree.md          # Device tree basics
-│   └── 13-debugging.md            # Debugging techniques
+│   ├── 10-kconfig-build-system.md # Kconfig and build system
+│   │
+│   │   # Real Driver Case Studies
+│   ├── 20-mpu6050-tutorial.md     # MPU6050 IMU (I2C + IIO + Regmap)
+│   ├── 21-hc-sr04-tutorial.md     # HC-SR04 Ultrasonic (GPIO + IRQ)
+│   ├── 22-neo-m8n-gps-tutorial.md # NEO-M8N GPS (GNSS + Serdev)
+│   ├── 23-uart-driver-tutorial.md # Custom UART (TTY + DMA)
+│   └── 24-spi-controller-tutorial.md # SPI Controller (DMA)
 │
 ├── drivers/                       # Driver source code
 │   ├── peripheral/                # Bus/Peripheral drivers
@@ -191,6 +195,79 @@ dmesg | tail -20
 2. Full UART Driver (`drivers/peripheral/uart/`)
 3. Full SPI Driver with DMA (`drivers/peripheral/spi/`)
 4. Production Driver Patterns
+
+---
+
+## Real Driver Case Studies
+
+These tutorials provide in-depth analysis of production-quality drivers in this repository. Each tutorial explains the **why** behind every pattern, not just the how.
+
+### Sensor Drivers
+
+| Tutorial | Driver | Key Concepts Learned |
+|----------|--------|---------------------|
+| [MPU6050 Tutorial](docs/20-mpu6050-tutorial.md) | 6-axis IMU | Regmap API, IIO triggered buffers, Kconfig options, FIFO handling, DMA allocation |
+| [HC-SR04 Tutorial](docs/21-hc-sr04-tutorial.md) | Ultrasonic sensor | GPIO descriptor API, both-edge IRQ, ktime precision timing, completion API |
+| [NEO-M8N Tutorial](docs/22-neo-m8n-gps-tutorial.md) | GPS receiver | GNSS subsystem, serdev (serial device), binary protocol parsing, state machines |
+
+### Peripheral/Controller Drivers
+
+| Tutorial | Driver | Key Concepts Learned |
+|----------|--------|---------------------|
+| [UART Tutorial](docs/23-uart-driver-tutorial.md) | Full UART controller | TTY layer, uart_port, DMA circular buffers, interrupt coalescing, flow control |
+| [SPI Tutorial](docs/24-spi-controller-tutorial.md) | SPI master controller | spi_controller, transfer_one callback, GPIO chip select, scatter-gather DMA |
+
+### Driver Skeleton Pattern
+
+Every driver in this repository follows an **8-part structure**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      UNIVERSAL DRIVER SKELETON                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  PART 1: INCLUDES & DEFINES                                             │
+│    #include <linux/module.h>                                            │
+│    #define DRIVER_NAME "my_driver"                                      │
+│                                                                          │
+│  PART 2: PRIVATE DATA STRUCTURE                                         │
+│    struct my_driver_data {                                              │
+│        struct device *dev;                                              │
+│        void __iomem *base;    /* or i2c_client, spi_device */          │
+│        /* ... */                                                        │
+│    };                                                                   │
+│                                                                          │
+│  PART 3: LOW-LEVEL I/O                                                  │
+│    static u32 my_read(struct my_driver_data *d, u32 reg);              │
+│    static void my_write(struct my_driver_data *d, u32 reg, u32 val);   │
+│                                                                          │
+│  PART 4: HARDWARE OPERATIONS                                            │
+│    static int my_hw_init(struct my_driver_data *d);                    │
+│    static int my_read_data(struct my_driver_data *d, int *val);        │
+│                                                                          │
+│  PART 5: SYSFS/SUBSYSTEM INTERFACE                                      │
+│    static ssize_t value_show(...);  /* or IIO read_raw, etc */         │
+│                                                                          │
+│  PART 6: PROBE FUNCTION                                                 │
+│    static int my_probe(struct platform_device *pdev) {                 │
+│        /* 1. Allocate private data */                                  │
+│        /* 2. Get resources (clocks, regs, IRQ) */                      │
+│        /* 3. Initialize hardware */                                    │
+│        /* 4. Register with subsystem */                                │
+│    }                                                                    │
+│                                                                          │
+│  PART 7: REMOVE FUNCTION                                                │
+│    static int my_remove(struct platform_device *pdev) {                │
+│        /* Cleanup in reverse order of probe */                         │
+│    }                                                                    │
+│                                                                          │
+│  PART 8: MODULE GLUE                                                    │
+│    static const struct of_device_id my_of_match[] = {...};             │
+│    module_platform_driver(my_driver);                                   │
+│    MODULE_LICENSE("GPL");                                               │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 

@@ -4,10 +4,17 @@
  * This is a complete SPI master controller driver demonstrating:
  * - SPI core framework integration
  * - Interrupt-driven transfers
- * - DMA support with scatter-gather
+ * - DMA support with scatter-gather (optional via Kconfig)
  * - Multiple chip select support
  * - Power management
  * - Device tree configuration
+ *
+ * Build Configuration (via Kconfig):
+ *   CONFIG_SPI_CUSTOM           - Enable driver (tristate)
+ *   CONFIG_SPI_CUSTOM_DMA       - Enable DMA support
+ *   CONFIG_SPI_CUSTOM_DMA_MIN_BYTES - Minimum bytes for DMA
+ *   CONFIG_SPI_CUSTOM_DEBUG     - Enable debug output
+ *   CONFIG_SPI_CUSTOM_MAX_CHIPSELECT - Maximum chip selects
  *
  * Copyright (C) 2024
  * Licensed under GPL v2
@@ -20,15 +27,49 @@
 #include <linux/io.h>
 #include <linux/of.h>
 #include <linux/interrupt.h>
-#include <linux/dma-mapping.h>
-#include <linux/dmaengine.h>
 #include <linux/pm_runtime.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 
+#ifdef CONFIG_SPI_CUSTOM_DMA
+#include <linux/dma-mapping.h>
+#include <linux/dmaengine.h>
+#endif
+
 #define DRIVER_NAME     "custom_spi"
-#define MAX_CS          4       /* Maximum chip selects */
+
+/* Maximum chip selects - configurable via Kconfig */
+#ifdef CONFIG_SPI_CUSTOM_MAX_CHIPSELECT
+#define MAX_CS          CONFIG_SPI_CUSTOM_MAX_CHIPSELECT
+#else
+#define MAX_CS          4
+#endif
+
 #define FIFO_DEPTH      64      /* Hardware FIFO depth */
+
+/* Minimum bytes for DMA - configurable via Kconfig */
+#ifdef CONFIG_SPI_CUSTOM_DMA_MIN_BYTES
+#define DMA_MIN_BYTES   CONFIG_SPI_CUSTOM_DMA_MIN_BYTES
+#else
+#define DMA_MIN_BYTES   64
+#endif
+
+/*
+ * ============================================================
+ * Debug Macros (Conditional)
+ * ============================================================
+ */
+
+#ifdef CONFIG_SPI_CUSTOM_DEBUG
+#define spi_dbg(dev, fmt, ...) \
+    dev_dbg(dev, "[SPI] " fmt, ##__VA_ARGS__)
+#define spi_dbg_xfer(spi, xfer) \
+    spi_dbg((spi)->dev, "xfer: len=%zu speed=%u bpw=%u\n", \
+            (xfer)->len, (xfer)->speed_hz, (xfer)->bits_per_word)
+#else
+#define spi_dbg(dev, fmt, ...) do { } while (0)
+#define spi_dbg_xfer(spi, xfer) do { } while (0)
+#endif
 
 /*
  * ============================================================
@@ -89,12 +130,14 @@
  * ============================================================
  */
 
+#ifdef CONFIG_SPI_CUSTOM_DMA
 struct custom_spi_dma {
     struct dma_chan         *chan;
     struct dma_slave_config cfg;
     struct sg_table         sgt;
     enum dma_data_direction dir;
 };
+#endif
 
 struct custom_spi {
     struct spi_controller   *controller;
@@ -115,11 +158,13 @@ struct custom_spi {
     struct completion       done;
     int                     status;
 
+#ifdef CONFIG_SPI_CUSTOM_DMA
     /* DMA */
     bool                    dma_enabled;
     struct custom_spi_dma   tx_dma;
     struct custom_spi_dma   rx_dma;
     dma_addr_t              phys_addr;
+#endif
 
     /* GPIO chip selects */
     struct gpio_desc        *cs_gpios[MAX_CS];
@@ -169,11 +214,13 @@ static inline void spi_clear_bits(struct custom_spi *spi, int reg, u32 bits)
 static void custom_spi_enable(struct custom_spi *spi)
 {
     spi_set_bits(spi, SPI_CR1, SPI_CR1_SSE);
+    spi_dbg(spi->dev, "SPI enabled\n");
 }
 
 static void custom_spi_disable(struct custom_spi *spi)
 {
     spi_clear_bits(spi, SPI_CR1, SPI_CR1_SSE);
+    spi_dbg(spi->dev, "SPI disabled\n");
 }
 
 static void custom_spi_flush_fifo(struct custom_spi *spi)
@@ -248,6 +295,8 @@ static int custom_spi_set_speed(struct custom_spi *spi, u32 speed_hz)
     /* Set prescaler */
     spi_write(spi, SPI_CPSR, cpsr);
 
+    spi_dbg(spi->dev, "speed=%u Hz, cpsr=%u, scr=%u\n", speed_hz, cpsr, scr);
+
     return 0;
 }
 
@@ -269,6 +318,9 @@ static void custom_spi_set_mode(struct custom_spi *spi, u32 mode)
         cr0 |= SPI_CR0_SPH;
 
     spi_write(spi, SPI_CR0, cr0);
+
+    spi_dbg(spi->dev, "mode=%u (CPOL=%d, CPHA=%d)\n",
+            mode, !!(mode & SPI_CPOL), !!(mode & SPI_CPHA));
 }
 
 static void custom_spi_set_bits_per_word(struct custom_spi *spi, u8 bits)
@@ -280,6 +332,8 @@ static void custom_spi_set_bits_per_word(struct custom_spi *spi, u8 bits)
 
     spi->bits_per_word = bits;
     spi_write(spi, SPI_CR0, cr0);
+
+    spi_dbg(spi->dev, "bits_per_word=%u\n", bits);
 }
 
 /*
@@ -301,6 +355,8 @@ static void custom_spi_cs_control(struct custom_spi *spi,
         gpiod_set_value_cansleep(spi->cs_gpios[cs], enable ? 1 : 0);
     else
         gpiod_set_value_cansleep(spi->cs_gpios[cs], enable ? 0 : 1);
+
+    spi_dbg(spi->dev, "CS%d %s\n", cs, enable ? "asserted" : "deasserted");
 }
 
 /*
@@ -385,14 +441,19 @@ static int custom_spi_pio_transfer(struct custom_spi *spi,
     /* Disable interrupts */
     spi_write(spi, SPI_IMSC, 0);
 
+    spi_dbg(spi->dev, "PIO transfer complete: %zu bytes, status=%d\n",
+            xfer->len, spi->status);
+
     return spi->status;
 }
 
 /*
  * ============================================================
- * DMA Transfer
+ * DMA Transfer (Conditional)
  * ============================================================
  */
+
+#ifdef CONFIG_SPI_CUSTOM_DMA
 
 static void custom_spi_dma_tx_callback(void *data)
 {
@@ -400,6 +461,7 @@ static void custom_spi_dma_tx_callback(void *data)
 
     /* TX DMA complete - nothing to do, wait for RX */
     spi->bytes_tx += spi->count;
+    spi_dbg(spi->dev, "TX DMA callback: %zu bytes\n", spi->count);
 }
 
 static void custom_spi_dma_rx_callback(void *data)
@@ -410,6 +472,7 @@ static void custom_spi_dma_rx_callback(void *data)
     spi->bytes_rx += spi->count;
     spi->status = 0;
     complete(&spi->done);
+    spi_dbg(spi->dev, "RX DMA callback: %zu bytes\n", spi->count);
 }
 
 static int custom_spi_dma_transfer(struct custom_spi *spi,
@@ -423,6 +486,8 @@ static int custom_spi_dma_transfer(struct custom_spi *spi,
 
     spi->count = xfer->len;
     reinit_completion(&spi->done);
+
+    spi_dbg(spi->dev, "Starting DMA transfer: %zu bytes\n", xfer->len);
 
     /* Configure TX DMA */
     if (xfer->tx_buf) {
@@ -511,12 +576,117 @@ static bool custom_spi_can_dma(struct spi_controller *ctlr,
 {
     struct custom_spi *spi = spi_controller_get_devdata(ctlr);
 
-    /* Use DMA for transfers larger than FIFO */
+    /* Use DMA for transfers larger than threshold */
     if (!spi->dma_enabled)
         return false;
 
-    return xfer->len > FIFO_DEPTH;
+    return xfer->len >= DMA_MIN_BYTES;
 }
+
+static int custom_spi_dma_init(struct custom_spi *spi)
+{
+    int ret;
+
+    /* Request TX DMA channel */
+    spi->tx_dma.chan = dma_request_chan(spi->dev, "tx");
+    if (IS_ERR(spi->tx_dma.chan)) {
+        ret = PTR_ERR(spi->tx_dma.chan);
+        spi->tx_dma.chan = NULL;
+        if (ret == -EPROBE_DEFER)
+            return ret;
+        dev_info(spi->dev, "TX DMA not available, using PIO\n");
+        goto no_dma;
+    }
+
+    /* Request RX DMA channel */
+    spi->rx_dma.chan = dma_request_chan(spi->dev, "rx");
+    if (IS_ERR(spi->rx_dma.chan)) {
+        ret = PTR_ERR(spi->rx_dma.chan);
+        spi->rx_dma.chan = NULL;
+        dma_release_channel(spi->tx_dma.chan);
+        spi->tx_dma.chan = NULL;
+        if (ret == -EPROBE_DEFER)
+            return ret;
+        dev_info(spi->dev, "RX DMA not available, using PIO\n");
+        goto no_dma;
+    }
+
+    /* Configure TX DMA */
+    spi->tx_dma.cfg.direction = DMA_MEM_TO_DEV;
+    spi->tx_dma.cfg.dst_addr = spi->phys_addr + SPI_DR;
+    spi->tx_dma.cfg.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
+    spi->tx_dma.cfg.dst_maxburst = 4;
+
+    ret = dmaengine_slave_config(spi->tx_dma.chan, &spi->tx_dma.cfg);
+    if (ret) {
+        dev_err(spi->dev, "TX DMA config failed\n");
+        goto err_release;
+    }
+
+    /* Configure RX DMA */
+    spi->rx_dma.cfg.direction = DMA_DEV_TO_MEM;
+    spi->rx_dma.cfg.src_addr = spi->phys_addr + SPI_DR;
+    spi->rx_dma.cfg.src_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
+    spi->rx_dma.cfg.src_maxburst = 4;
+
+    ret = dmaengine_slave_config(spi->rx_dma.chan, &spi->rx_dma.cfg);
+    if (ret) {
+        dev_err(spi->dev, "RX DMA config failed\n");
+        goto err_release;
+    }
+
+    spi->dma_enabled = true;
+    dev_info(spi->dev, "DMA enabled (min transfer: %d bytes)\n", DMA_MIN_BYTES);
+    return 0;
+
+err_release:
+    dma_release_channel(spi->tx_dma.chan);
+    dma_release_channel(spi->rx_dma.chan);
+    spi->tx_dma.chan = NULL;
+    spi->rx_dma.chan = NULL;
+no_dma:
+    spi->dma_enabled = false;
+    return 0;
+}
+
+static void custom_spi_dma_release(struct custom_spi *spi)
+{
+    if (spi->tx_dma.chan) {
+        dmaengine_terminate_sync(spi->tx_dma.chan);
+        dma_release_channel(spi->tx_dma.chan);
+    }
+
+    if (spi->rx_dma.chan) {
+        dmaengine_terminate_sync(spi->rx_dma.chan);
+        dma_release_channel(spi->rx_dma.chan);
+    }
+}
+
+#else /* !CONFIG_SPI_CUSTOM_DMA */
+
+static inline int custom_spi_dma_init(struct custom_spi *spi)
+{
+    return 0;
+}
+
+static inline void custom_spi_dma_release(struct custom_spi *spi)
+{
+}
+
+static inline bool custom_spi_can_dma(struct spi_controller *ctlr,
+                                      struct spi_device *spi_dev,
+                                      struct spi_transfer *xfer)
+{
+    return false;
+}
+
+static inline int custom_spi_dma_transfer(struct custom_spi *spi,
+                                          struct spi_transfer *xfer)
+{
+    return -ENODEV;
+}
+
+#endif /* CONFIG_SPI_CUSTOM_DMA */
 
 /*
  * ============================================================
@@ -594,6 +764,8 @@ static int custom_spi_transfer_one(struct spi_controller *ctlr,
     struct custom_spi *spi = spi_controller_get_devdata(ctlr);
     int ret;
 
+    spi_dbg_xfer(spi, xfer);
+
     /* Configure for this transfer */
     ret = custom_spi_set_speed(spi, xfer->speed_hz);
     if (ret)
@@ -610,12 +782,16 @@ static int custom_spi_transfer_one(struct spi_controller *ctlr,
     spi->status = 0;
 
     /* Perform transfer */
+#ifdef CONFIG_SPI_CUSTOM_DMA
     if (custom_spi_can_dma(ctlr, spi_dev, xfer) &&
         xfer->tx_dma && xfer->rx_dma) {
         ret = custom_spi_dma_transfer(spi, xfer);
     } else {
         ret = custom_spi_pio_transfer(spi, xfer);
     }
+#else
+    ret = custom_spi_pio_transfer(spi, xfer);
+#endif
 
     /* Wait for transfer to complete */
     custom_spi_wait_idle(spi);
@@ -649,91 +825,6 @@ static void custom_spi_set_cs(struct spi_device *spi_dev, bool enable)
 
 /*
  * ============================================================
- * DMA Initialization
- * ============================================================
- */
-
-static int custom_spi_dma_init(struct custom_spi *spi)
-{
-    int ret;
-
-    /* Request TX DMA channel */
-    spi->tx_dma.chan = dma_request_chan(spi->dev, "tx");
-    if (IS_ERR(spi->tx_dma.chan)) {
-        ret = PTR_ERR(spi->tx_dma.chan);
-        spi->tx_dma.chan = NULL;
-        if (ret == -EPROBE_DEFER)
-            return ret;
-        dev_info(spi->dev, "TX DMA not available, using PIO\n");
-        goto no_dma;
-    }
-
-    /* Request RX DMA channel */
-    spi->rx_dma.chan = dma_request_chan(spi->dev, "rx");
-    if (IS_ERR(spi->rx_dma.chan)) {
-        ret = PTR_ERR(spi->rx_dma.chan);
-        spi->rx_dma.chan = NULL;
-        dma_release_channel(spi->tx_dma.chan);
-        spi->tx_dma.chan = NULL;
-        if (ret == -EPROBE_DEFER)
-            return ret;
-        dev_info(spi->dev, "RX DMA not available, using PIO\n");
-        goto no_dma;
-    }
-
-    /* Configure TX DMA */
-    spi->tx_dma.cfg.direction = DMA_MEM_TO_DEV;
-    spi->tx_dma.cfg.dst_addr = spi->phys_addr + SPI_DR;
-    spi->tx_dma.cfg.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
-    spi->tx_dma.cfg.dst_maxburst = 4;
-
-    ret = dmaengine_slave_config(spi->tx_dma.chan, &spi->tx_dma.cfg);
-    if (ret) {
-        dev_err(spi->dev, "TX DMA config failed\n");
-        goto err_release;
-    }
-
-    /* Configure RX DMA */
-    spi->rx_dma.cfg.direction = DMA_DEV_TO_MEM;
-    spi->rx_dma.cfg.src_addr = spi->phys_addr + SPI_DR;
-    spi->rx_dma.cfg.src_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE;
-    spi->rx_dma.cfg.src_maxburst = 4;
-
-    ret = dmaengine_slave_config(spi->rx_dma.chan, &spi->rx_dma.cfg);
-    if (ret) {
-        dev_err(spi->dev, "RX DMA config failed\n");
-        goto err_release;
-    }
-
-    spi->dma_enabled = true;
-    dev_info(spi->dev, "DMA enabled\n");
-    return 0;
-
-err_release:
-    dma_release_channel(spi->tx_dma.chan);
-    dma_release_channel(spi->rx_dma.chan);
-    spi->tx_dma.chan = NULL;
-    spi->rx_dma.chan = NULL;
-no_dma:
-    spi->dma_enabled = false;
-    return 0;
-}
-
-static void custom_spi_dma_release(struct custom_spi *spi)
-{
-    if (spi->tx_dma.chan) {
-        dmaengine_terminate_sync(spi->tx_dma.chan);
-        dma_release_channel(spi->tx_dma.chan);
-    }
-
-    if (spi->rx_dma.chan) {
-        dmaengine_terminate_sync(spi->rx_dma.chan);
-        dma_release_channel(spi->rx_dma.chan);
-    }
-}
-
-/*
- * ============================================================
  * Hardware Initialization
  * ============================================================
  */
@@ -758,6 +849,8 @@ static int custom_spi_hw_init(struct custom_spi *spi)
 
     /* Flush FIFOs */
     custom_spi_flush_fifo(spi);
+
+    spi_dbg(spi->dev, "Hardware initialized\n");
 
     return 0;
 }
@@ -793,7 +886,9 @@ static int custom_spi_probe(struct platform_device *pdev)
     if (IS_ERR(spi->regs))
         return PTR_ERR(spi->regs);
 
+#ifdef CONFIG_SPI_CUSTOM_DMA
     spi->phys_addr = res->start;
+#endif
 
     /* Get clock */
     spi->clk = devm_clk_get(dev, NULL);
@@ -860,7 +955,9 @@ static int custom_spi_probe(struct platform_device *pdev)
     ctlr->transfer_one = custom_spi_transfer_one;
     ctlr->unprepare_message = custom_spi_unprepare_message;
     ctlr->set_cs = custom_spi_set_cs;
+#ifdef CONFIG_SPI_CUSTOM_DMA
     ctlr->can_dma = custom_spi_can_dma;
+#endif
     ctlr->dev.of_node = dev->of_node;
 
     platform_set_drvdata(pdev, spi);
@@ -872,8 +969,23 @@ static int custom_spi_probe(struct platform_device *pdev)
         goto err_dma_release;
     }
 
-    dev_info(dev, "SPI controller registered, %d CS, %s\n",
-             spi->num_cs, spi->dma_enabled ? "DMA" : "PIO");
+    dev_info(dev, "SPI controller registered, %d CS (max %d)",
+             spi->num_cs, MAX_CS);
+
+#ifdef CONFIG_SPI_CUSTOM_DMA
+    if (spi->dma_enabled)
+        pr_cont(" [DMA]");
+    else
+        pr_cont(" [PIO]");
+#else
+    pr_cont(" [PIO only]");
+#endif
+
+#ifdef CONFIG_SPI_CUSTOM_DEBUG
+    pr_cont(" [DEBUG]");
+#endif
+
+    pr_cont("\n");
 
     return 0;
 
@@ -948,5 +1060,5 @@ module_platform_driver(custom_spi_driver);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Linux Driver Tutorial");
-MODULE_DESCRIPTION("Full-Featured SPI Controller Driver with DMA");
-MODULE_VERSION("1.0");
+MODULE_DESCRIPTION("Full-Featured SPI Controller Driver with Kconfig options");
+MODULE_VERSION("1.1");

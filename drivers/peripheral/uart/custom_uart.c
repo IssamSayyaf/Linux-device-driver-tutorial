@@ -5,10 +5,19 @@
  * - TTY subsystem integration
  * - Serial core framework
  * - Interrupt-driven TX/RX
- * - DMA support
+ * - DMA support (optional via Kconfig)
  * - Hardware flow control (RTS/CTS)
- * - Console support
+ * - Console support (optional via Kconfig)
+ * - RS-485 support (optional via Kconfig)
  * - Power management
+ *
+ * Build Configuration (via Kconfig):
+ *   CONFIG_SERIAL_CUSTOM_UART         - Enable driver (tristate)
+ *   CONFIG_SERIAL_CUSTOM_UART_CONSOLE - Enable console support
+ *   CONFIG_SERIAL_CUSTOM_UART_DMA     - Enable DMA support
+ *   CONFIG_SERIAL_CUSTOM_UART_DMA_BUFFER_SIZE - DMA buffer size
+ *   CONFIG_SERIAL_CUSTOM_UART_NR_UARTS - Maximum UART ports
+ *   CONFIG_SERIAL_CUSTOM_UART_RS485   - Enable RS-485 support
  *
  * Copyright (C) 2024
  * Licensed under GPL v2
@@ -20,19 +29,39 @@
 #include <linux/serial.h>
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
-#include <linux/console.h>
 #include <linux/clk.h>
 #include <linux/io.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
-#include <linux/dma-mapping.h>
-#include <linux/dmaengine.h>
 #include <linux/interrupt.h>
 #include <linux/pm_runtime.h>
 
+#ifdef CONFIG_SERIAL_CUSTOM_UART_CONSOLE
+#include <linux/console.h>
+#endif
+
+#ifdef CONFIG_SERIAL_CUSTOM_UART_DMA
+#include <linux/dma-mapping.h>
+#include <linux/dmaengine.h>
+#endif
+
 #define DRIVER_NAME     "custom_uart"
-#define UART_NR         4       /* Maximum number of UARTs */
+
+/* Maximum number of UARTs - configurable via Kconfig */
+#ifdef CONFIG_SERIAL_CUSTOM_UART_NR_UARTS
+#define UART_NR         CONFIG_SERIAL_CUSTOM_UART_NR_UARTS
+#else
+#define UART_NR         4
+#endif
+
 #define FIFO_SIZE       64      /* Hardware FIFO depth */
+
+/* DMA buffer size - configurable via Kconfig */
+#ifdef CONFIG_SERIAL_CUSTOM_UART_DMA_BUFFER_SIZE
+#define DMA_BUF_SIZE    CONFIG_SERIAL_CUSTOM_UART_DMA_BUFFER_SIZE
+#else
+#define DMA_BUF_SIZE    4096
+#endif
 
 /*
  * ============================================================
@@ -125,6 +154,7 @@
  * ============================================================
  */
 
+#ifdef CONFIG_SERIAL_CUSTOM_UART_DMA
 struct custom_uart_dma {
     struct dma_chan         *chan;
     struct dma_async_tx_descriptor *desc;
@@ -134,6 +164,7 @@ struct custom_uart_dma {
     dma_cookie_t            cookie;
     bool                    running;
 };
+#endif /* CONFIG_SERIAL_CUSTOM_UART_DMA */
 
 struct custom_uart_port {
     struct uart_port        port;
@@ -142,14 +173,22 @@ struct custom_uart_port {
     unsigned int            mcr;            /* Cached MCR value */
     unsigned int            lcr;            /* Cached LCR value */
 
+#ifdef CONFIG_SERIAL_CUSTOM_UART_DMA
     /* DMA support */
     bool                    dma_enabled;
     struct custom_uart_dma  tx_dma;
     struct custom_uart_dma  rx_dma;
+#endif
 
+#ifdef CONFIG_SERIAL_CUSTOM_UART_CONSOLE
     /* Flags */
     bool                    console_enabled;
+#endif
+
+#ifdef CONFIG_SERIAL_CUSTOM_UART_RS485
     bool                    rs485_enabled;
+    struct serial_rs485     rs485;
+#endif
 
     /* Statistics */
     unsigned long           rx_bytes;
@@ -253,6 +292,69 @@ static void custom_uart_clear_fifos(struct custom_uart_port *up)
 
 /*
  * ============================================================
+ * RS-485 Support (Conditional)
+ * ============================================================
+ */
+
+#ifdef CONFIG_SERIAL_CUSTOM_UART_RS485
+static void custom_uart_rs485_start_tx(struct custom_uart_port *up)
+{
+    if (!up->rs485_enabled)
+        return;
+
+    /* Assert RTS for transmit (DE = Driver Enable) */
+    if (up->rs485.flags & SER_RS485_RTS_ON_SEND)
+        up->mcr |= UART_MCR_RTS;
+    else
+        up->mcr &= ~UART_MCR_RTS;
+
+    uart_write(up, UART_MCR, up->mcr);
+
+    /* Delay before transmitting if configured */
+    if (up->rs485.delay_rts_before_send)
+        udelay(up->rs485.delay_rts_before_send);
+}
+
+static void custom_uart_rs485_stop_tx(struct custom_uart_port *up)
+{
+    if (!up->rs485_enabled)
+        return;
+
+    /* Wait for transmitter to be empty */
+    while (!(uart_read(up, UART_LSR) & UART_LSR_TEMT))
+        cpu_relax();
+
+    /* Delay after transmitting if configured */
+    if (up->rs485.delay_rts_after_send)
+        udelay(up->rs485.delay_rts_after_send);
+
+    /* Deassert RTS (disable driver) */
+    if (up->rs485.flags & SER_RS485_RTS_AFTER_SEND)
+        up->mcr |= UART_MCR_RTS;
+    else
+        up->mcr &= ~UART_MCR_RTS;
+
+    uart_write(up, UART_MCR, up->mcr);
+}
+
+static int custom_uart_rs485_config(struct uart_port *port,
+                                    struct ktermios *termios,
+                                    struct serial_rs485 *rs485)
+{
+    struct custom_uart_port *up = container_of(port, struct custom_uart_port, port);
+
+    up->rs485 = *rs485;
+    up->rs485_enabled = !!(rs485->flags & SER_RS485_ENABLED);
+
+    return 0;
+}
+#else
+static inline void custom_uart_rs485_start_tx(struct custom_uart_port *up) { }
+static inline void custom_uart_rs485_stop_tx(struct custom_uart_port *up) { }
+#endif /* CONFIG_SERIAL_CUSTOM_UART_RS485 */
+
+/*
+ * ============================================================
  * TX Functions
  * ============================================================
  */
@@ -289,6 +391,7 @@ static void custom_uart_tx_chars(struct custom_uart_port *up)
 
     if (uart_circ_empty(xmit) || uart_tx_stopped(&up->port)) {
         custom_uart_stop_tx_pio(up);
+        custom_uart_rs485_stop_tx(up);
         return;
     }
 
@@ -305,8 +408,10 @@ static void custom_uart_tx_chars(struct custom_uart_port *up)
     if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
         uart_write_wakeup(&up->port);
 
-    if (uart_circ_empty(xmit))
+    if (uart_circ_empty(xmit)) {
         custom_uart_stop_tx_pio(up);
+        custom_uart_rs485_stop_tx(up);
+    }
 }
 
 /*
@@ -373,11 +478,11 @@ next_char:
 
 /*
  * ============================================================
- * DMA Functions
+ * DMA Functions (Conditional)
  * ============================================================
  */
 
-#define DMA_BUF_SIZE    4096
+#ifdef CONFIG_SERIAL_CUSTOM_UART_DMA
 
 static void custom_uart_tx_dma_callback(void *data)
 {
@@ -400,6 +505,8 @@ static void custom_uart_tx_dma_callback(void *data)
     if (!uart_circ_empty(xmit) && !uart_tx_stopped(&up->port)) {
         /* Schedule next DMA transfer */
         /* ... */
+    } else {
+        custom_uart_rs485_stop_tx(up);
     }
 
     spin_unlock_irqrestore(&up->port.lock, flags);
@@ -526,7 +633,7 @@ static int custom_uart_init_dma(struct custom_uart_port *up)
     }
 
     up->dma_enabled = true;
-    dev_info(dev, "DMA enabled for TX and RX\n");
+    dev_info(dev, "DMA enabled (buffer size: %d bytes)\n", DMA_BUF_SIZE);
     return 0;
 
 err_free_tx_buf:
@@ -564,6 +671,24 @@ static void custom_uart_release_dma(struct custom_uart_port *up)
 
     up->dma_enabled = false;
 }
+
+#else /* !CONFIG_SERIAL_CUSTOM_UART_DMA */
+
+static inline int custom_uart_init_dma(struct custom_uart_port *up)
+{
+    return 0;
+}
+
+static inline void custom_uart_release_dma(struct custom_uart_port *up)
+{
+}
+
+static inline int custom_uart_start_tx_dma(struct custom_uart_port *up)
+{
+    return -ENODEV;
+}
+
+#endif /* CONFIG_SERIAL_CUSTOM_UART_DMA */
 
 /*
  * ============================================================
@@ -674,21 +799,28 @@ static void custom_uart_stop_tx(struct uart_port *port)
 {
     struct custom_uart_port *up = container_of(port, struct custom_uart_port, port);
 
+#ifdef CONFIG_SERIAL_CUSTOM_UART_DMA
     if (up->dma_enabled && up->tx_dma.running)
         dmaengine_terminate_async(up->tx_dma.chan);
+#endif
 
     custom_uart_stop_tx_pio(up);
+    custom_uart_rs485_stop_tx(up);
 }
 
 static void custom_uart_start_tx(struct uart_port *port)
 {
     struct custom_uart_port *up = container_of(port, struct custom_uart_port, port);
 
+    custom_uart_rs485_start_tx(up);
+
+#ifdef CONFIG_SERIAL_CUSTOM_UART_DMA
     if (up->dma_enabled) {
         if (custom_uart_start_tx_dma(up) == 0)
             return;
         /* Fall back to PIO on DMA failure */
     }
+#endif
 
     custom_uart_start_tx_pio(up);
 }
@@ -917,15 +1049,18 @@ static const struct uart_ops custom_uart_ops = {
     .request_port   = custom_uart_request_port,
     .config_port    = custom_uart_config_port,
     .verify_port    = custom_uart_verify_port,
+#ifdef CONFIG_SERIAL_CUSTOM_UART_RS485
+    .rs485_config   = custom_uart_rs485_config,
+#endif
 };
 
 /*
  * ============================================================
- * Console Support
+ * Console Support (Conditional)
  * ============================================================
  */
 
-#ifdef CONFIG_SERIAL_CUSTOM_CONSOLE
+#ifdef CONFIG_SERIAL_CUSTOM_UART_CONSOLE
 
 static void custom_uart_console_putchar(struct uart_port *port, unsigned char ch)
 {
@@ -1001,7 +1136,7 @@ static struct console custom_uart_console = {
 
 #else
 #define CUSTOM_UART_CONSOLE     NULL
-#endif /* CONFIG_SERIAL_CUSTOM_CONSOLE */
+#endif /* CONFIG_SERIAL_CUSTOM_UART_CONSOLE */
 
 /*
  * ============================================================
@@ -1040,7 +1175,7 @@ static int custom_uart_probe(struct platform_device *pdev)
     }
 
     if (port_id >= UART_NR) {
-        dev_err(dev, "Invalid port ID: %u\n", port_id);
+        dev_err(dev, "Invalid port ID: %u (max %d)\n", port_id, UART_NR - 1);
         return -EINVAL;
     }
 
@@ -1081,6 +1216,16 @@ static int custom_uart_probe(struct platform_device *pdev)
     up->port.flags = UPF_BOOT_AUTOCONF;
     up->port.line = port_id;
 
+#ifdef CONFIG_SERIAL_CUSTOM_UART_RS485
+    up->port.rs485_config = custom_uart_rs485_config;
+    up->port.rs485_supported = (struct serial_rs485) {
+        .flags = SER_RS485_ENABLED | SER_RS485_RTS_ON_SEND |
+                 SER_RS485_RTS_AFTER_SEND,
+        .delay_rts_before_send = 1,
+        .delay_rts_after_send = 1,
+    };
+#endif
+
     spin_lock_init(&up->port.lock);
 
     /* Map registers */
@@ -1109,9 +1254,19 @@ static int custom_uart_probe(struct platform_device *pdev)
 
     platform_set_drvdata(pdev, up);
 
-    dev_info(dev, "UART%u registered at 0x%llx, IRQ %d%s\n",
-             port_id, (unsigned long long)res->start, irq,
-             up->dma_enabled ? " (DMA)" : "");
+    dev_info(dev, "UART%u registered at 0x%llx, IRQ %d",
+             port_id, (unsigned long long)res->start, irq);
+
+#ifdef CONFIG_SERIAL_CUSTOM_UART_DMA
+    if (up->dma_enabled)
+        pr_cont(" [DMA]");
+#endif
+
+#ifdef CONFIG_SERIAL_CUSTOM_UART_RS485
+    pr_cont(" [RS485]");
+#endif
+
+    pr_cont("\n");
 
     return 0;
 }
@@ -1177,6 +1332,8 @@ static int __init custom_uart_init(void)
 {
     int ret;
 
+    pr_info("Custom UART driver init (max ports: %d)\n", UART_NR);
+
     ret = uart_register_driver(&custom_uart_driver);
     if (ret)
         return ret;
@@ -1199,5 +1356,5 @@ module_exit(custom_uart_exit);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Linux Driver Tutorial");
-MODULE_DESCRIPTION("Full-Featured UART Controller Driver");
-MODULE_VERSION("1.0");
+MODULE_DESCRIPTION("Full-Featured UART Controller Driver with Kconfig options");
+MODULE_VERSION("1.1");

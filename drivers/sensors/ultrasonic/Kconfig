@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Kconfig for HC-SR04 Ultrasonic Sensor Driver
+#
+
+config HC_SR04
+	tristate "HC-SR04 Ultrasonic Distance Sensor"
+	depends on GPIOLIB
+	select IIO
+	help
+	  Say Y here if you want to support the HC-SR04 ultrasonic
+	  distance sensor.
+
+	  This driver uses two GPIO pins (trigger and echo) to measure
+	  distance using ultrasonic pulses. The distance is exposed
+	  through the IIO subsystem.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called hc_sr04.
+
+	  If unsure, say N.
+
+if HC_SR04
+
+config HC_SR04_HRTIMER
+	bool "Use high-resolution timer for measurements"
+	depends on HC_SR04
+	depends on HIGH_RES_TIMERS
+	help
+	  Say Y here to use high-resolution timers for more accurate
+	  distance measurements. This improves measurement precision
+	  but requires CONFIG_HIGH_RES_TIMERS.
+
+	  If unsure, say Y if available.
+
+config HC_SR04_TEMPERATURE_COMPENSATION
+	bool "Temperature compensation"
+	depends on HC_SR04
+	default y
+	help
+	  Say Y here to enable temperature compensation for distance
+	  calculations. The speed of sound varies with temperature,
+	  and compensation improves accuracy.
+
+	  You can set the ambient temperature via sysfs or IIO.
+
+config HC_SR04_DEBUG
+	bool "Enable debug output"
+	depends on HC_SR04
+	help
+	  Say Y here to enable debug output including timing
+	  information for each measurement.
+
+	  If unsure, say N.
+
+endif # HC_SR04

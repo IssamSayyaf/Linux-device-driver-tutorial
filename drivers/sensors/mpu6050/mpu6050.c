@@ -1,19 +1,24 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * mpu6050.c - InvenSense MPU6050 6-Axis Accelerometer/Gyroscope Driver
  *
  * This driver demonstrates:
  * - I2C client driver
  * - IIO subsystem integration
- * - Triggered buffer support
- * - Interrupt handling
+ * - Triggered buffer support (optional via Kconfig)
+ * - Interrupt handling (optional via Kconfig)
+ * - DMA support (optional via Kconfig)
+ * - FIFO buffering (optional via Kconfig)
  * - Power management
  * - Device tree configuration
  *
- * The MPU6050 is a 6-axis motion tracking device combining:
- * - 3-axis gyroscope (±250/500/1000/2000 °/s)
- * - 3-axis accelerometer (±2/4/8/16 g)
- * - Temperature sensor
- * - Digital Motion Processor (DMP)
+ * Kconfig options:
+ * - CONFIG_MPU6050: Enable the driver (tristate: y/m/n)
+ * - CONFIG_MPU6050_IRQ: Enable interrupt support
+ * - CONFIG_MPU6050_TRIGGER: Enable hardware trigger
+ * - CONFIG_MPU6050_DMA: Enable DMA buffer support
+ * - CONFIG_MPU6050_FIFO: Use internal FIFO
+ * - CONFIG_MPU6050_DEBUG: Enable debug output
  *
  * Copyright (C) 2024
  * Licensed under GPL v2
@@ -23,17 +28,41 @@
 #include <linux/i2c.h>
 #include <linux/regmap.h>
 #include <linux/delay.h>
-#include <linux/interrupt.h>
 #include <linux/pm_runtime.h>
 
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
 #include <linux/iio/buffer.h>
+
+/* Conditional includes based on Kconfig */
+#ifdef CONFIG_MPU6050_IRQ
+#include <linux/interrupt.h>
+#endif
+
+#ifdef CONFIG_MPU6050_TRIGGER
 #include <linux/iio/trigger.h>
 #include <linux/iio/trigger_consumer.h>
 #include <linux/iio/triggered_buffer.h>
+#endif
+
+#ifdef CONFIG_MPU6050_DMA
+#include <linux/dma-mapping.h>
+#endif
 
 #define DRIVER_NAME "mpu6050"
+
+/*
+ * Debug macros - only enabled with CONFIG_MPU6050_DEBUG
+ */
+#ifdef CONFIG_MPU6050_DEBUG
+#define mpu_dbg(dev, fmt, ...) \
+    dev_dbg(dev, "[MPU6050] " fmt, ##__VA_ARGS__)
+#define mpu_dbg_reg(dev, reg, val) \
+    dev_dbg(dev, "[MPU6050] Reg 0x%02x = 0x%02x\n", reg, val)
+#else
+#define mpu_dbg(dev, fmt, ...) do { } while (0)
+#define mpu_dbg_reg(dev, reg, val) do { } while (0)
+#endif
 
 /*
  * ============================================================
@@ -69,8 +98,13 @@
 #define MPU6050_REG_GYRO_ZOUT_H     0x47
 #define MPU6050_REG_GYRO_ZOUT_L     0x48
 
-/* Power management */
+/* FIFO registers */
 #define MPU6050_REG_USER_CTRL       0x6A    /* User Control */
+#define MPU6050_REG_FIFO_COUNT_H    0x72    /* FIFO Count High */
+#define MPU6050_REG_FIFO_COUNT_L    0x73    /* FIFO Count Low */
+#define MPU6050_REG_FIFO_R_W        0x74    /* FIFO Read/Write */
+
+/* Power management */
 #define MPU6050_REG_PWR_MGMT_1      0x6B    /* Power Management 1 */
 #define MPU6050_REG_PWR_MGMT_2      0x6C    /* Power Management 2 */
 
@@ -91,6 +125,17 @@
 #define MPU6050_PWR1_CLKSEL_MASK    0x07
 #define MPU6050_PWR1_CLKSEL_PLL_X   0x01    /* PLL with X gyro reference */
 
+/* USER_CTRL */
+#define MPU6050_USR_FIFO_EN         BIT(6)
+#define MPU6050_USR_FIFO_RST        BIT(2)
+
+/* FIFO_EN */
+#define MPU6050_FIFO_TEMP_EN        BIT(7)
+#define MPU6050_FIFO_XG_EN          BIT(6)
+#define MPU6050_FIFO_YG_EN          BIT(5)
+#define MPU6050_FIFO_ZG_EN          BIT(4)
+#define MPU6050_FIFO_ACCEL_EN       BIT(3)
+
 /* GYRO_CONFIG */
 #define MPU6050_GYRO_FS_SEL_SHIFT   3
 #define MPU6050_GYRO_FS_250         0x00    /* ±250 °/s */
@@ -107,6 +152,7 @@
 
 /* INT_ENABLE / INT_STATUS */
 #define MPU6050_INT_DATA_RDY_EN     BIT(0)
+#define MPU6050_INT_FIFO_OFLOW_EN   BIT(4)
 
 /* INT_PIN_CFG */
 #define MPU6050_INT_LEVEL_HIGH      0
@@ -115,10 +161,25 @@
 #define MPU6050_INT_LATCH_EN        BIT(5)
 #define MPU6050_INT_RD_CLEAR        BIT(4)
 
-/* WHO_AM_I value */
+/* WHO_AM_I values */
 #define MPU6050_WHO_AM_I_VALUE      0x68
 #define MPU6500_WHO_AM_I_VALUE      0x70
 #define MPU9250_WHO_AM_I_VALUE      0x71
+
+/*
+ * ============================================================
+ * Kconfig-dependent Buffer Sizes
+ * ============================================================
+ */
+
+#ifdef CONFIG_MPU6050_DMA_BUFFER_SIZE
+#define MPU6050_DMA_SAMPLES         CONFIG_MPU6050_DMA_BUFFER_SIZE
+#else
+#define MPU6050_DMA_SAMPLES         64
+#endif
+
+#define MPU6050_SAMPLE_SIZE         14  /* 3 accel + 1 temp + 3 gyro × 2 bytes */
+#define MPU6050_DMA_BUF_SIZE        (MPU6050_DMA_SAMPLES * MPU6050_SAMPLE_SIZE)
 
 /*
  * ============================================================
@@ -126,24 +187,7 @@
  * ============================================================
  */
 
-/* Accelerometer scale: LSB/g */
-static const int mpu6050_accel_scale[] = {
-    16384,  /* ±2g:  16384 LSB/g */
-    8192,   /* ±4g:  8192 LSB/g */
-    4096,   /* ±8g:  4096 LSB/g */
-    2048,   /* ±16g: 2048 LSB/g */
-};
-
-/* Gyroscope scale: LSB/(°/s) */
-static const int mpu6050_gyro_scale[] = {
-    131,    /* ±250 °/s:  131 LSB/(°/s) */
-    65,     /* ±500 °/s:  65.5 LSB/(°/s) */
-    32,     /* ±1000 °/s: 32.8 LSB/(°/s) */
-    16,     /* ±2000 °/s: 16.4 LSB/(°/s) */
-};
-
 /* Scale values for IIO (micro-units per LSB) */
-/* Accel: m/s² = raw / scale * 9.80665 */
 static const int mpu6050_accel_scale_table[] = {
     598,    /* 2g:  9.80665 / 16384 * 1000000 = 598.550 */
     1197,   /* 4g:  9.80665 / 8192 * 1000000 = 1197.10 */
@@ -151,7 +195,6 @@ static const int mpu6050_accel_scale_table[] = {
     4788,   /* 16g: 9.80665 / 2048 * 1000000 = 4788.40 */
 };
 
-/* Gyro: rad/s = raw / scale * (π/180) */
 static const int mpu6050_gyro_scale_table[] = {
     133,    /* 250:  (1/131) * (π/180) * 1000000 = 133.23 */
     266,    /* 500:  (1/65.5) * (π/180) * 1000000 = 266.32 */
@@ -168,7 +211,6 @@ static const int mpu6050_gyro_scale_table[] = {
 struct mpu6050_data {
     struct i2c_client *client;
     struct regmap *regmap;
-    struct iio_trigger *trig;
 
     /* Current configuration */
     u8 accel_fs;        /* Accelerometer full-scale range index */
@@ -179,7 +221,14 @@ struct mpu6050_data {
     s16 accel_offset[3];
     s16 gyro_offset[3];
 
-    /* Data buffer for triggered reads */
+    /* Data buffer for triggered reads - DMA aligned if DMA enabled */
+#ifdef CONFIG_MPU6050_DMA
+    u8 *dma_buffer;
+    dma_addr_t dma_handle;
+    size_t dma_buf_size;
+#endif
+
+    /* Standard buffer for non-DMA mode */
     struct {
         s16 accel[3];
         s16 gyro[3];
@@ -187,9 +236,21 @@ struct mpu6050_data {
         s64 timestamp __aligned(8);
     } buffer;
 
+#ifdef CONFIG_MPU6050_IRQ
     /* IRQ */
     int irq;
     bool irq_enabled;
+#endif
+
+#ifdef CONFIG_MPU6050_TRIGGER
+    struct iio_trigger *trig;
+#endif
+
+#ifdef CONFIG_MPU6050_FIFO
+    /* FIFO state */
+    bool fifo_enabled;
+    u16 fifo_count;
+#endif
 };
 
 /*
@@ -203,6 +264,9 @@ static bool mpu6050_volatile_reg(struct device *dev, unsigned int reg)
     switch (reg) {
     case MPU6050_REG_INT_STATUS:
     case MPU6050_REG_ACCEL_XOUT_H ... MPU6050_REG_GYRO_ZOUT_L:
+    case MPU6050_REG_FIFO_COUNT_H:
+    case MPU6050_REG_FIFO_COUNT_L:
+    case MPU6050_REG_FIFO_R_W:
         return true;
     default:
         return false;
@@ -305,10 +369,13 @@ static int mpu6050_read_raw_data(struct mpu6050_data *data, int reg, s16 *val)
     int ret;
 
     ret = regmap_bulk_read(data->regmap, reg, buf, 2);
-    if (ret)
+    if (ret) {
+        mpu_dbg(&data->client->dev, "Read reg 0x%02x failed: %d\n", reg, ret);
         return ret;
+    }
 
     *val = (s16)((buf[0] << 8) | buf[1]);
+    mpu_dbg(&data->client->dev, "Read reg 0x%02x: raw=%d\n", reg, *val);
     return 0;
 }
 
@@ -360,6 +427,8 @@ static int mpu6050_read_all_data(struct mpu6050_data *data)
     u8 buf[14];
     int ret;
 
+    mpu_dbg(&data->client->dev, "Reading all sensor data\n");
+
     /* Read all sensor data in one burst (accel, temp, gyro) */
     ret = regmap_bulk_read(data->regmap, MPU6050_REG_ACCEL_XOUT_H, buf, 14);
     if (ret)
@@ -383,6 +452,114 @@ static int mpu6050_read_all_data(struct mpu6050_data *data)
 
 /*
  * ============================================================
+ * FIFO Functions (CONFIG_MPU6050_FIFO)
+ * ============================================================
+ */
+
+#ifdef CONFIG_MPU6050_FIFO
+
+static int mpu6050_fifo_enable(struct mpu6050_data *data, bool enable)
+{
+    int ret;
+
+    mpu_dbg(&data->client->dev, "FIFO %s\n", enable ? "enable" : "disable");
+
+    if (enable) {
+        /* Reset FIFO */
+        ret = regmap_update_bits(data->regmap, MPU6050_REG_USER_CTRL,
+                                 MPU6050_USR_FIFO_RST, MPU6050_USR_FIFO_RST);
+        if (ret)
+            return ret;
+
+        /* Enable sensors in FIFO */
+        ret = regmap_write(data->regmap, MPU6050_REG_FIFO_EN,
+                          MPU6050_FIFO_ACCEL_EN |
+                          MPU6050_FIFO_TEMP_EN |
+                          MPU6050_FIFO_XG_EN |
+                          MPU6050_FIFO_YG_EN |
+                          MPU6050_FIFO_ZG_EN);
+        if (ret)
+            return ret;
+
+        /* Enable FIFO */
+        ret = regmap_update_bits(data->regmap, MPU6050_REG_USER_CTRL,
+                                 MPU6050_USR_FIFO_EN, MPU6050_USR_FIFO_EN);
+    } else {
+        /* Disable FIFO */
+        ret = regmap_update_bits(data->regmap, MPU6050_REG_USER_CTRL,
+                                 MPU6050_USR_FIFO_EN, 0);
+        if (ret)
+            return ret;
+
+        ret = regmap_write(data->regmap, MPU6050_REG_FIFO_EN, 0);
+    }
+
+    if (!ret)
+        data->fifo_enabled = enable;
+
+    return ret;
+}
+
+static int mpu6050_fifo_read_count(struct mpu6050_data *data, u16 *count)
+{
+    u8 buf[2];
+    int ret;
+
+    ret = regmap_bulk_read(data->regmap, MPU6050_REG_FIFO_COUNT_H, buf, 2);
+    if (ret)
+        return ret;
+
+    *count = (buf[0] << 8) | buf[1];
+    mpu_dbg(&data->client->dev, "FIFO count: %u bytes\n", *count);
+    return 0;
+}
+
+static int mpu6050_fifo_read_data(struct mpu6050_data *data, u8 *buf, size_t len)
+{
+    return regmap_bulk_read(data->regmap, MPU6050_REG_FIFO_R_W, buf, len);
+}
+
+#endif /* CONFIG_MPU6050_FIFO */
+
+/*
+ * ============================================================
+ * DMA Functions (CONFIG_MPU6050_DMA)
+ * ============================================================
+ */
+
+#ifdef CONFIG_MPU6050_DMA
+
+static int mpu6050_dma_alloc(struct mpu6050_data *data)
+{
+    struct device *dev = &data->client->dev;
+
+    data->dma_buf_size = MPU6050_DMA_BUF_SIZE;
+    data->dma_buffer = dma_alloc_coherent(dev, data->dma_buf_size,
+                                          &data->dma_handle, GFP_KERNEL);
+    if (!data->dma_buffer) {
+        dev_warn(dev, "DMA buffer allocation failed, using PIO\n");
+        return -ENOMEM;
+    }
+
+    dev_info(dev, "DMA buffer allocated: %zu bytes\n", data->dma_buf_size);
+    return 0;
+}
+
+static void mpu6050_dma_free(struct mpu6050_data *data)
+{
+    struct device *dev = &data->client->dev;
+
+    if (data->dma_buffer) {
+        dma_free_coherent(dev, data->dma_buf_size,
+                          data->dma_buffer, data->dma_handle);
+        data->dma_buffer = NULL;
+    }
+}
+
+#endif /* CONFIG_MPU6050_DMA */
+
+/*
+ * ============================================================
  * Configuration Functions
  * ============================================================
  */
@@ -393,6 +570,8 @@ static int mpu6050_set_accel_scale(struct mpu6050_data *data, int fs)
 
     if (fs < 0 || fs > 3)
         return -EINVAL;
+
+    mpu_dbg(&data->client->dev, "Set accel scale: %d\n", fs);
 
     ret = regmap_update_bits(data->regmap, MPU6050_REG_ACCEL_CONFIG,
                              0x18, fs << MPU6050_ACCEL_FS_SEL_SHIFT);
@@ -410,6 +589,8 @@ static int mpu6050_set_gyro_scale(struct mpu6050_data *data, int fs)
     if (fs < 0 || fs > 3)
         return -EINVAL;
 
+    mpu_dbg(&data->client->dev, "Set gyro scale: %d\n", fs);
+
     ret = regmap_update_bits(data->regmap, MPU6050_REG_GYRO_CONFIG,
                              0x18, fs << MPU6050_GYRO_FS_SEL_SHIFT);
     if (ret)
@@ -426,12 +607,11 @@ static int mpu6050_set_sample_rate(struct mpu6050_data *data, int rate)
     if (rate < 4 || rate > 1000)
         return -EINVAL;
 
-    /* Sample Rate = Gyro Output Rate / (1 + SMPLRT_DIV)
-     * Gyro Output Rate = 1kHz when DLPF is enabled
-     */
     divider = (1000 / rate) - 1;
-
     data->sample_rate = 1000 / (divider + 1);
+
+    mpu_dbg(&data->client->dev, "Set sample rate: %d Hz (div=%d)\n",
+            data->sample_rate, divider);
 
     return regmap_write(data->regmap, MPU6050_REG_SMPLRT_DIV, divider);
 }
@@ -481,17 +661,14 @@ static int mpu6050_read_raw(struct iio_dev *indio_dev,
     case IIO_CHAN_INFO_SCALE:
         switch (chan->type) {
         case IIO_ACCEL:
-            /* Return scale in m/s² per LSB */
             *val = 0;
             *val2 = mpu6050_accel_scale_table[data->accel_fs];
             return IIO_VAL_INT_PLUS_MICRO;
         case IIO_ANGL_VEL:
-            /* Return scale in rad/s per LSB */
             *val = 0;
             *val2 = mpu6050_gyro_scale_table[data->gyro_fs];
             return IIO_VAL_INT_PLUS_MICRO;
         case IIO_TEMP:
-            /* Scale: 1/340 °C per LSB = 2941.18 micro */
             *val = 0;
             *val2 = 2941;
             return IIO_VAL_INT_PLUS_MICRO;
@@ -501,7 +678,6 @@ static int mpu6050_read_raw(struct iio_dev *indio_dev,
 
     case IIO_CHAN_INFO_OFFSET:
         if (chan->type == IIO_TEMP) {
-            /* Offset: 36.53°C at raw=0, so offset = 36.53 * 340 = 12420 */
             *val = 12420;
             return IIO_VAL_INT;
         }
@@ -596,9 +772,11 @@ static int mpu6050_write_raw_get_fmt(struct iio_dev *indio_dev,
 
 /*
  * ============================================================
- * Triggered Buffer
+ * Triggered Buffer (CONFIG_MPU6050_TRIGGER)
  * ============================================================
  */
+
+#ifdef CONFIG_MPU6050_TRIGGER
 
 static irqreturn_t mpu6050_trigger_handler(int irq, void *p)
 {
@@ -607,66 +785,106 @@ static irqreturn_t mpu6050_trigger_handler(int irq, void *p)
     struct mpu6050_data *data = iio_priv(indio_dev);
     int ret;
 
-    ret = mpu6050_read_all_data(data);
-    if (ret)
-        goto done;
+    mpu_dbg(&data->client->dev, "Trigger handler called\n");
 
-    iio_push_to_buffers_with_timestamp(indio_dev, &data->buffer,
-                                       iio_get_time_ns(indio_dev));
+#ifdef CONFIG_MPU6050_FIFO
+    if (data->fifo_enabled) {
+        u16 count;
+        ret = mpu6050_fifo_read_count(data, &count);
+        if (!ret && count >= MPU6050_SAMPLE_SIZE) {
+            u8 fifo_buf[MPU6050_SAMPLE_SIZE];
+            ret = mpu6050_fifo_read_data(data, fifo_buf, MPU6050_SAMPLE_SIZE);
+            if (!ret) {
+                /* Parse FIFO data */
+                data->buffer.accel[0] = (s16)((fifo_buf[0] << 8) | fifo_buf[1]);
+                data->buffer.accel[1] = (s16)((fifo_buf[2] << 8) | fifo_buf[3]);
+                data->buffer.accel[2] = (s16)((fifo_buf[4] << 8) | fifo_buf[5]);
+                data->buffer.temp = (s16)((fifo_buf[6] << 8) | fifo_buf[7]);
+                data->buffer.gyro[0] = (s16)((fifo_buf[8] << 8) | fifo_buf[9]);
+                data->buffer.gyro[1] = (s16)((fifo_buf[10] << 8) | fifo_buf[11]);
+                data->buffer.gyro[2] = (s16)((fifo_buf[12] << 8) | fifo_buf[13]);
+            }
+        }
+    } else
+#endif
+    {
+        ret = mpu6050_read_all_data(data);
+    }
 
-done:
+    if (!ret)
+        iio_push_to_buffers_with_timestamp(indio_dev, &data->buffer,
+                                           iio_get_time_ns(indio_dev));
+
     iio_trigger_notify_done(indio_dev->trig);
     return IRQ_HANDLED;
 }
 
+#endif /* CONFIG_MPU6050_TRIGGER */
+
 /*
  * ============================================================
- * Data Ready Interrupt
+ * Data Ready Interrupt (CONFIG_MPU6050_IRQ)
  * ============================================================
  */
+
+#ifdef CONFIG_MPU6050_IRQ
 
 static irqreturn_t mpu6050_data_ready_irq(int irq, void *private)
 {
     struct iio_dev *indio_dev = private;
+#ifdef CONFIG_MPU6050_TRIGGER
     struct mpu6050_data *data = iio_priv(indio_dev);
+
+    mpu_dbg(&data->client->dev, "Data ready IRQ\n");
 
     if (data->trig)
         iio_trigger_poll(data->trig);
+#endif
 
     return IRQ_HANDLED;
 }
 
-/*
- * ============================================================
- * Trigger Operations
- * ============================================================
- */
-
+#ifdef CONFIG_MPU6050_TRIGGER
 static int mpu6050_trigger_set_state(struct iio_trigger *trig, bool state)
 {
     struct iio_dev *indio_dev = iio_trigger_get_drvdata(trig);
     struct mpu6050_data *data = iio_priv(indio_dev);
     int ret;
 
+    mpu_dbg(&data->client->dev, "Trigger state: %s\n",
+            state ? "enable" : "disable");
+
     if (state) {
         /* Enable data ready interrupt */
         ret = regmap_write(data->regmap, MPU6050_REG_INT_ENABLE,
                            MPU6050_INT_DATA_RDY_EN);
+
+#ifdef CONFIG_MPU6050_FIFO
+        /* Enable FIFO if configured */
+        if (!ret)
+            ret = mpu6050_fifo_enable(data, true);
+#endif
     } else {
-        /* Disable data ready interrupt */
+        /* Disable interrupts */
         ret = regmap_write(data->regmap, MPU6050_REG_INT_ENABLE, 0);
+
+#ifdef CONFIG_MPU6050_FIFO
+        mpu6050_fifo_enable(data, false);
+#endif
     }
 
-    if (ret)
-        return ret;
+    if (!ret)
+        data->irq_enabled = state;
 
-    data->irq_enabled = state;
-    return 0;
+    return ret;
 }
 
 static const struct iio_trigger_ops mpu6050_trigger_ops = {
     .set_trigger_state = mpu6050_trigger_set_state,
 };
+#endif /* CONFIG_MPU6050_TRIGGER */
+
+#endif /* CONFIG_MPU6050_IRQ */
 
 /*
  * ============================================================
@@ -690,6 +908,8 @@ static int mpu6050_hw_init(struct mpu6050_data *data)
 {
     unsigned int val;
     int ret;
+
+    mpu_dbg(&data->client->dev, "Hardware init starting\n");
 
     /* Reset device */
     ret = regmap_write(data->regmap, MPU6050_REG_PWR_MGMT_1,
@@ -723,32 +943,31 @@ static int mpu6050_hw_init(struct mpu6050_data *data)
     dev_info(&data->client->dev, "MPU device ID: 0x%02x\n", val);
 
     /* Configure default settings */
-    /* Set DLPF to 42 Hz for both accel and gyro */
     ret = regmap_write(data->regmap, MPU6050_REG_CONFIG, 0x03);
     if (ret)
         return ret;
 
-    /* Set accelerometer to ±2g */
     ret = mpu6050_set_accel_scale(data, MPU6050_ACCEL_FS_2G);
     if (ret)
         return ret;
 
-    /* Set gyroscope to ±250 °/s */
     ret = mpu6050_set_gyro_scale(data, MPU6050_GYRO_FS_250);
     if (ret)
         return ret;
 
-    /* Set sample rate to 100 Hz */
     ret = mpu6050_set_sample_rate(data, 100);
     if (ret)
         return ret;
 
+#ifdef CONFIG_MPU6050_IRQ
     /* Configure interrupt pin */
     ret = regmap_write(data->regmap, MPU6050_REG_INT_PIN_CFG,
                        MPU6050_INT_LATCH_EN | MPU6050_INT_RD_CLEAR);
     if (ret)
         return ret;
+#endif
 
+    mpu_dbg(&data->client->dev, "Hardware init complete\n");
     return 0;
 }
 
@@ -764,6 +983,37 @@ static int mpu6050_probe(struct i2c_client *client)
     struct iio_dev *indio_dev;
     struct mpu6050_data *data;
     int ret;
+
+    dev_info(dev, "MPU6050 probe starting\n");
+
+    /* Print enabled features */
+    dev_info(dev, "Features: %s%s%s%s%s\n",
+#ifdef CONFIG_MPU6050_IRQ
+             "IRQ ",
+#else
+             "",
+#endif
+#ifdef CONFIG_MPU6050_TRIGGER
+             "TRIGGER ",
+#else
+             "",
+#endif
+#ifdef CONFIG_MPU6050_DMA
+             "DMA ",
+#else
+             "",
+#endif
+#ifdef CONFIG_MPU6050_FIFO
+             "FIFO ",
+#else
+             "",
+#endif
+#ifdef CONFIG_MPU6050_DEBUG
+             "DEBUG"
+#else
+             ""
+#endif
+    );
 
     /* Allocate IIO device */
     indio_dev = devm_iio_device_alloc(dev, sizeof(*data));
@@ -782,11 +1032,18 @@ static int mpu6050_probe(struct i2c_client *client)
         return PTR_ERR(data->regmap);
     }
 
+#ifdef CONFIG_MPU6050_DMA
+    /* Allocate DMA buffer */
+    ret = mpu6050_dma_alloc(data);
+    if (ret)
+        dev_warn(dev, "DMA not available, using PIO\n");
+#endif
+
     /* Initialize hardware */
     ret = mpu6050_hw_init(data);
     if (ret) {
         dev_err(dev, "Hardware init failed\n");
-        return ret;
+        goto err_dma_free;
     }
 
     /* Setup IIO device */
@@ -796,6 +1053,7 @@ static int mpu6050_probe(struct i2c_client *client)
     indio_dev->channels = mpu6050_channels;
     indio_dev->num_channels = ARRAY_SIZE(mpu6050_channels);
 
+#ifdef CONFIG_MPU6050_TRIGGER
     /* Setup triggered buffer */
     ret = devm_iio_triggered_buffer_setup(dev, indio_dev,
                                           iio_pollfunc_store_time,
@@ -803,17 +1061,24 @@ static int mpu6050_probe(struct i2c_client *client)
                                           NULL);
     if (ret) {
         dev_err(dev, "Failed to setup triggered buffer\n");
-        return ret;
+        goto err_dma_free;
     }
+#endif
 
+#ifdef CONFIG_MPU6050_IRQ
     /* Setup data ready trigger if IRQ available */
     data->irq = client->irq;
     if (data->irq > 0) {
+        dev_info(dev, "Setting up IRQ %d\n", data->irq);
+
+#ifdef CONFIG_MPU6050_TRIGGER
         data->trig = devm_iio_trigger_alloc(dev, "%s-dev%d",
                                             indio_dev->name,
                                             iio_device_id(indio_dev));
-        if (!data->trig)
-            return -ENOMEM;
+        if (!data->trig) {
+            ret = -ENOMEM;
+            goto err_dma_free;
+        }
 
         data->trig->ops = &mpu6050_trigger_ops;
         iio_trigger_set_drvdata(data->trig, indio_dev);
@@ -821,31 +1086,63 @@ static int mpu6050_probe(struct i2c_client *client)
         ret = devm_iio_trigger_register(dev, data->trig);
         if (ret) {
             dev_err(dev, "Failed to register trigger\n");
-            return ret;
+            goto err_dma_free;
         }
+#endif
 
         ret = devm_request_irq(dev, data->irq, mpu6050_data_ready_irq,
                                IRQF_TRIGGER_RISING,
                                DRIVER_NAME, indio_dev);
         if (ret) {
             dev_err(dev, "Failed to request IRQ\n");
-            return ret;
+            goto err_dma_free;
         }
 
+#ifdef CONFIG_MPU6050_TRIGGER
         indio_dev->trig = iio_trigger_get(data->trig);
+#endif
+    } else {
+        dev_info(dev, "No IRQ specified, polling mode only\n");
     }
+#endif /* CONFIG_MPU6050_IRQ */
 
     /* Register IIO device */
     ret = devm_iio_device_register(dev, indio_dev);
     if (ret) {
         dev_err(dev, "Failed to register IIO device\n");
-        return ret;
+        goto err_dma_free;
     }
 
     dev_info(dev, "MPU6050 initialized, sample rate %d Hz\n",
              data->sample_rate);
 
     return 0;
+
+err_dma_free:
+#ifdef CONFIG_MPU6050_DMA
+    mpu6050_dma_free(data);
+#endif
+    return ret;
+}
+
+static void mpu6050_remove(struct i2c_client *client)
+{
+    struct iio_dev *indio_dev = i2c_get_clientdata(client);
+    struct mpu6050_data *data = iio_priv(indio_dev);
+
+    mpu_dbg(&client->dev, "Removing driver\n");
+
+#ifdef CONFIG_MPU6050_FIFO
+    mpu6050_fifo_enable(data, false);
+#endif
+
+#ifdef CONFIG_MPU6050_DMA
+    mpu6050_dma_free(data);
+#endif
+
+    /* Put device to sleep */
+    regmap_update_bits(data->regmap, MPU6050_REG_PWR_MGMT_1,
+                       MPU6050_PWR1_SLEEP, MPU6050_PWR1_SLEEP);
 }
 
 /*
@@ -859,7 +1156,8 @@ static int mpu6050_suspend(struct device *dev)
     struct iio_dev *indio_dev = dev_get_drvdata(dev);
     struct mpu6050_data *data = iio_priv(indio_dev);
 
-    /* Put device to sleep */
+    mpu_dbg(dev, "Suspending\n");
+
     return regmap_update_bits(data->regmap, MPU6050_REG_PWR_MGMT_1,
                               MPU6050_PWR1_SLEEP, MPU6050_PWR1_SLEEP);
 }
@@ -870,15 +1168,14 @@ static int mpu6050_resume(struct device *dev)
     struct mpu6050_data *data = iio_priv(indio_dev);
     int ret;
 
-    /* Wake up device */
+    mpu_dbg(dev, "Resuming\n");
+
     ret = regmap_update_bits(data->regmap, MPU6050_REG_PWR_MGMT_1,
                              MPU6050_PWR1_SLEEP, 0);
     if (ret)
         return ret;
 
-    /* Wait for device to stabilize */
     msleep(10);
-
     return 0;
 }
 
@@ -914,11 +1211,12 @@ static struct i2c_driver mpu6050_driver = {
         .pm = pm_sleep_ptr(&mpu6050_pm_ops),
     },
     .probe = mpu6050_probe,
+    .remove = mpu6050_remove,
     .id_table = mpu6050_id,
 };
 module_i2c_driver(mpu6050_driver);
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Linux Driver Tutorial");
-MODULE_DESCRIPTION("InvenSense MPU6050 6-Axis Accelerometer/Gyroscope Driver");
-MODULE_VERSION("1.0");
+MODULE_DESCRIPTION("InvenSense MPU6050 6-Axis IMU Driver with Kconfig options");
+MODULE_VERSION("2.0");

@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Kconfig for Custom SPI Controller Driver
+#
+
+config SPI_CUSTOM
+	tristate "Custom SPI Controller Driver"
+	depends on HAS_IOMEM
+	depends on SPI_MASTER
+	help
+	  This driver supports the Custom SPI controller as a master.
+	  It provides full SPI functionality including multiple chip
+	  selects, configurable clock rates, and all SPI modes.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called custom_spi.
+
+	  If unsure, say N.
+
+if SPI_CUSTOM
+
+config SPI_CUSTOM_DMA
+	bool "DMA support for Custom SPI"
+	depends on SPI_CUSTOM
+	depends on DMADEVICES
+	select DMA_ENGINE
+	help
+	  Say Y here to enable DMA support for the Custom SPI controller.
+	  DMA can significantly improve performance for large transfers
+	  by offloading data movement to the DMA controller.
+
+	  When DMA is enabled, small transfers (smaller than FIFO depth)
+	  will still use PIO mode for efficiency.
+
+	  If unsure, say Y.
+
+config SPI_CUSTOM_DMA_MIN_BYTES
+	int "Minimum bytes for DMA transfer"
+	depends on SPI_CUSTOM_DMA
+	default 64
+	range 16 4096
+	help
+	  Set the minimum transfer size to use DMA. Transfers smaller
+	  than this will use PIO (programmed I/O) mode instead.
+
+	  The default is 64 bytes (FIFO depth). Setting this higher
+	  reduces DMA overhead for medium-sized transfers.
+
+config SPI_CUSTOM_DEBUG
+	bool "Enable debug output"
+	depends on SPI_CUSTOM
+	help
+	  Say Y here to enable verbose debug output for the Custom SPI
+	  driver. This will print detailed information about transfers,
+	  DMA operations, and register accesses.
+
+	  This is useful for debugging but will impact performance.
+
+	  If unsure, say N.
+
+config SPI_CUSTOM_MAX_CHIPSELECT
+	int "Maximum number of chip selects"
+	depends on SPI_CUSTOM
+	default 4
+	range 1 16
+	help
+	  Set the maximum number of chip selects supported by each
+	  Custom SPI controller instance.
+
+endif # SPI_CUSTOM

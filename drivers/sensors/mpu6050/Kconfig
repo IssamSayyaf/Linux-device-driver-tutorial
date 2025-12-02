@@ -1,0 +1,132 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Kconfig for MPU6050 6-Axis IMU Driver
+#
+
+config MPU6050
+	tristate "InvenSense MPU6050 6-Axis Accelerometer/Gyroscope"
+	depends on I2C
+	select IIO
+	select IIO_BUFFER
+	select IIO_TRIGGERED_BUFFER
+	select REGMAP_I2C
+	help
+	  Say Y here if you want to support the InvenSense MPU6050,
+	  MPU6500, or MPU9250 6-axis accelerometer/gyroscope sensors.
+
+	  This driver provides access to the sensor data through the
+	  Industrial I/O (IIO) subsystem.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called mpu6050.
+
+if MPU6050
+
+config MPU6050_I2C
+	tristate "MPU6050 I2C support"
+	depends on MPU6050
+	depends on I2C
+	select REGMAP_I2C
+	default y if MPU6050
+	help
+	  Say Y here to enable I2C support for the MPU6050.
+	  This is the most common interface for the MPU6050.
+
+config MPU6050_SPI
+	tristate "MPU6050 SPI support"
+	depends on MPU6050
+	depends on SPI_MASTER
+	select REGMAP_SPI
+	help
+	  Say Y here to enable SPI support for the MPU6050/6500/9250.
+	  Note: The original MPU6050 only supports I2C, but MPU6500
+	  and MPU9250 support both I2C and SPI.
+
+config MPU6050_IRQ
+	bool "Interrupt support for MPU6050"
+	depends on MPU6050
+	default y
+	help
+	  Say Y here to enable interrupt support for the MPU6050.
+	  This allows using the Data Ready interrupt for efficient
+	  triggered buffer data capture.
+
+	  When enabled, the driver will request an IRQ if specified
+	  in the device tree and set up a hardware trigger.
+
+	  If unsure, say Y.
+
+config MPU6050_TRIGGER
+	bool "Hardware trigger support"
+	depends on MPU6050
+	depends on MPU6050_IRQ
+	select IIO_TRIGGER
+	default y
+	help
+	  Say Y here to enable hardware trigger support using the
+	  MPU6050's Data Ready interrupt. This creates an IIO trigger
+	  that can be used for synchronized sampling.
+
+	  If unsure, say Y.
+
+config MPU6050_DMA
+	bool "DMA support for MPU6050 buffer reads"
+	depends on MPU6050
+	depends on DMADEVICES
+	depends on I2C_DMA_SAFE_BUFFER || SPI_MASTER
+	help
+	  Say Y here to enable DMA for reading sensor data buffers.
+	  This can improve performance when reading large amounts of
+	  buffered data by using DMA-safe buffers.
+
+	  Note: This requires that the I2C or SPI controller supports
+	  DMA transfers.
+
+	  If unsure, say N.
+
+config MPU6050_DMA_BUFFER_SIZE
+	int "DMA buffer size (samples)"
+	depends on MPU6050_DMA
+	default 64
+	range 16 1024
+	help
+	  Set the number of samples to buffer for DMA transfers.
+	  Each sample is 14 bytes (3 accel + 1 temp + 3 gyro × 2 bytes).
+
+	  Larger buffers reduce CPU overhead but increase latency.
+
+config MPU6050_FIFO
+	bool "Use MPU6050 internal FIFO"
+	depends on MPU6050
+	help
+	  Say Y here to use the MPU6050's internal FIFO for data
+	  buffering. The FIFO can hold up to 1024 bytes of sensor data.
+
+	  Using the FIFO can reduce I2C bus traffic and allow burst
+	  reads of multiple samples.
+
+	  If unsure, say N.
+
+config MPU6050_DMP
+	bool "Digital Motion Processor (DMP) support"
+	depends on MPU6050
+	help
+	  Say Y here to enable support for the MPU6050's Digital Motion
+	  Processor (DMP). The DMP can perform sensor fusion calculations
+	  (quaternions, Euler angles) in hardware.
+
+	  Note: This requires loading firmware to the DMP.
+
+	  If unsure, say N.
+
+config MPU6050_DEBUG
+	bool "Enable debug output"
+	depends on MPU6050
+	help
+	  Say Y here to enable verbose debug output for the MPU6050
+	  driver. This includes register read/write logging and
+	  interrupt handling debug.
+
+	  If unsure, say N.
+
+endif # MPU6050

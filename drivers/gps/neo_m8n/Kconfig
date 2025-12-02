@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Kconfig for u-blox NEO-M8N GPS/GNSS Driver
+#
+
+config GNSS_UBLOX_NEO
+	tristate "u-blox NEO-M8N/M9N GPS/GNSS Driver"
+	depends on SERIAL_DEV_BUS
+	select GNSS
+	help
+	  Say Y here if you want to support u-blox NEO-M8 series
+	  and NEO-M9 series GPS/GNSS modules.
+
+	  This driver supports:
+	    - NEO-M8N (GPS, GLONASS, Galileo, BeiDou)
+	    - NEO-M8M (GPS, GLONASS)
+	    - NEO-M8Q (GPS, GLONASS, Galileo, BeiDou)
+	    - NEO-M9N (GPS, GLONASS, Galileo, BeiDou)
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called ublox_neo_m8n.
+
+	  If unsure, say N.
+
+if GNSS_UBLOX_NEO
+
+config GNSS_UBLOX_NEO_UBX
+	bool "UBX protocol support"
+	depends on GNSS_UBLOX_NEO
+	default y
+	help
+	  Say Y here to enable u-blox UBX binary protocol support
+	  in addition to NMEA. UBX protocol provides more detailed
+	  positioning information and device configuration.
+
+	  If unsure, say Y.
+
+config GNSS_UBLOX_NEO_PPS
+	bool "PPS (Pulse Per Second) support"
+	depends on GNSS_UBLOX_NEO
+	depends on PPS
+	help
+	  Say Y here to enable PPS (Pulse Per Second) support for
+	  precise time synchronization. This requires the TIMEPULSE
+	  pin to be connected to a GPIO with interrupt capability.
+
+config GNSS_UBLOX_NEO_POWER_MANAGEMENT
+	bool "Power management support"
+	depends on GNSS_UBLOX_NEO
+	default y
+	help
+	  Say Y here to enable power management for the GPS module.
+	  This allows putting the module into low-power modes when
+	  not actively acquiring position.
+
+config GNSS_UBLOX_NEO_DEBUG
+	bool "Enable debug output"
+	depends on GNSS_UBLOX_NEO
+	help
+	  Say Y here to enable debug output including UBX message
+	  parsing and NMEA sentence logging.
+
+	  If unsure, say N.
+
+endif # GNSS_UBLOX_NEO
